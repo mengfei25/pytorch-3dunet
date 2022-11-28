@@ -9,6 +9,7 @@ function main {
     set_environment
 
     # requirements
+    export HDF5_USE_FILE_LOCKING=FALSE
     if [ "${DATASET_DIR}" == "" ] || [ "${CKPT_DIR}" == "" ];then
         set +x
         echo "[ERROR] Please set DATASET_DIR and CKPT_DIR before launch"
@@ -38,7 +39,6 @@ function main {
             --channels_last $channels_last \
             ${addtion_options} || true
         #
-        continue
         for batch_size in ${batch_size_list[@]}
         do
             # clean workspace
