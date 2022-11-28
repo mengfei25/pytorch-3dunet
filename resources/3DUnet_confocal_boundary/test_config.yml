@@ -1,5 +1,5 @@
 # Download test data from: https://osf.io/8jz7e/
-model_path: 'val/best_ckpt.pt'
+model_path: PATH_TO_CKPT
 model:
   name: UNet3D
   # number of input channels to the model
@@ -29,7 +29,8 @@ loaders:
   dataset: StandardHDF5Dataset
   test:
     file_paths:
-      - 'val/N_420_ds2x.h5'
+      - 'PATH_TO_DATADIR/N_420_ds2x.h5'
+      # - 'PATH_TO_DATADIR/N_464_ds2x.h5'
 
     slice_builder:
       name: SliceBuilder

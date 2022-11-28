@@ -1,0 +1,5 @@
+pyyaml
+scikit-image
+scipy
+h5py
+tensorboard
