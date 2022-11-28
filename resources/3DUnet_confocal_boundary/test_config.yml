@@ -1,5 +1,5 @@
 # Download test data from: https://osf.io/8jz7e/
-model_path: PATH_TO_BEST_CHECKPOINT
+model_path: 'val/best_ckpt.pt'
 model:
   name: UNet3D
   # number of input channels to the model
@@ -18,17 +18,18 @@ predictor:
   name: 'StandardPredictor'
 loaders:
   # save predictions to output_dir
-  output_dir: PATH_TO_OUTPUT_DIR
+  # output_dir: PATH_TO_OUTPUT_DIR
   # batch dimension; if number of GPUs is N > 1, then a batch_size of N * batch_size will automatically be taken for DataParallel
   batch_size: 1
   # mirror pad the raw data in each axis for sharper prediction near the boundaries of the volume
   mirror_padding: [16, 32, 32]
   # how many subprocesses to use for data loading
-  num_workers: 8
+  num_workers: 0
   # test loaders configuration
+  dataset: StandardHDF5Dataset
   test:
     file_paths:
-      - PATH_TO_TEST_DIR
+      - 'val/N_420_ds2x.h5'
 
     slice_builder:
       name: SliceBuilder

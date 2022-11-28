@@ -1,5 +1,6 @@
 import importlib
 import os
+import argparse
 
 import torch
 import torch.nn as nn
@@ -25,6 +26,12 @@ def _get_predictor(model, output_dir, config):
 def main():
     # Load configuration
     config = load_config()
+    # set quantized engine
+    if config['oob']['quantized_engine'] is not None:
+        torch.backends.quantized.engine = config['oob']['quantized_engine']
+    else:
+        config['oob']['quantized_engine'] = torch.backends.quantized.engine
+    print("backends quantized engine is {}".format(torch.backends.quantized.engine))
 
     # Create the model
     model = get_model(config['model'])
@@ -48,11 +55,22 @@ def main():
         logger.info(f'Saving predictions to: {output_dir}')
 
     # create predictor instance
-    predictor = _get_predictor(model, output_dir, config)
-
     for test_loader in get_test_loaders(config):
         # run the model prediction on the test_loader and save the results in the output_dir
-        predictor(test_loader)
+        if config['oob']['precision'] == "bfloat16":
+            print("---- Use AMP bfloat16")
+            with torch.cpu.amp.autocast(enabled=True, dtype=torch.bfloat16):
+                predictor = _get_predictor(model, output_dir, config)
+                predictor(test_loader)
+        elif config['oob']['precision'] == "float16":
+            print("---- Use AMP float16")
+            with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
+                predictor = _get_predictor(model, output_dir, config)
+                predictor(test_loader)
+        else:
+            predictor = _get_predictor(model, output_dir, config)
+            predictor(test_loader)
+        break
 
 
 if __name__ == '__main__':

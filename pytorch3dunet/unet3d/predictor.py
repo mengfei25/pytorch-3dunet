@@ -1,4 +1,5 @@
 import os
+import time
 
 import h5py
 import numpy as np
@@ -121,48 +122,125 @@ class StandardPredictor(_AbstractPredictor):
         # Sets the module in evaluation mode explicitly
         # It is necessary for batchnorm/dropout layers if present as well as final Sigmoid/Softmax to be applied
         self.model.eval()
-        # Run predictions on the entire input dataset
         with torch.no_grad():
             for batch, indices in test_loader:
-                # send batch to device
-                batch = batch.to(device)
+                # CL
+                if self.config['oob']['channels_last']:
+                    self.model = self.model.to(memory_format=torch.channels_last_3d)
+                    print("---- Use CL model.")
+                # FX INT8
+                if self.config['oob']['precision'] == "int8":
+                    print('Converting int8 model...')
+                    from torch.ao.quantization import get_default_qconfig_mapping
+                    from torch.ao.quantization.quantize_fx import prepare_fx, convert_fx
+                    qconfig_mapping = get_default_qconfig_mapping(self.config['oob']['quantized_engine'])
+                    prepared_model = prepare_fx(self.model, qconfig_mapping, batch)
+                    for i in range(3):
+                        prepared_model(batch)
+                    self.mode = convert_fx(prepared_model)
+                    print('Convert int8 model done...')
+                # JIT
+                if self.config['oob']['jit']:
+                    self.model = torch.jit.trace(self.model, batch, check_trace=False)
+                    self.model = torch.jit.freeze(self.model)
+                    print("---- Use traced model")
+                break
 
-                # forward pass
-                predictions = self.model(batch)
+        # Run predictions on the entire input dataset
+        def test(p=None):
+            with torch.no_grad():
+                total_time = 0.0
+                total_sample = 0
+                for i, (batch, indices) in enumerate(test_loader):
+                    if self.config['oob']['num_iter'] > 0  and i >= self.config['oob']['num_iter']:
+                        break
+                    if self.config['oob']['channels_last']:
+                        batch = batch.contiguous(memory_format=torch.channels_last_3d)
 
-                # wrap predictions into a list if there is only one output head from the network
-                if output_heads == 1:
-                    predictions = [predictions]
+                    tic = time.time()
+                    # send batch to device
+                    batch = batch.to(device)
+                    # forward pass
+                    predictions = self.model(batch)
+                    if torch.cuda.is_available(): torch.cuda.synchronize()
+                    toc = time.time()
+                    if p is not None:
+                        p.step()
+                    print("Iteration: {}, inference time: {} sec.".format(i, toc - tic), flush=True)
+                    if i >= self.config['oob']['num_warmup']:
+                        total_time += toc - tic
+                        total_sample += self.config['loaders']['batch_size']
 
-                # for each output head
-                for prediction, prediction_map, normalization_mask in zip(predictions, prediction_maps,
-                                                                          normalization_masks):
+                    continue
+                    # wrap predictions into a list if there is only one output head from the network
+                    if output_heads == 1:
+                        predictions = [predictions]
 
-                    # convert to numpy array
-                    prediction = prediction.cpu().numpy()
+                    # for each output head
+                    for prediction, prediction_map, normalization_mask in zip(predictions, prediction_maps,
+                                                                            normalization_masks):
 
-                    # for each batch sample
-                    for pred, index in zip(prediction, indices):
-                        # save patch index: (C,D,H,W)
-                        if prediction_channel is None:
-                            channel_slice = slice(0, out_channels)
-                        else:
-                            channel_slice = slice(0, 1)
-                        index = (channel_slice,) + index
+                        # convert to numpy array
+                        prediction = prediction.cpu().numpy()
 
-                        if prediction_channel is not None:
-                            # use only the 'prediction_channel'
-                            logger.info(f"Using channel '{prediction_channel}'...")
-                            pred = np.expand_dims(pred[prediction_channel], axis=0)
+                        # for each batch sample
+                        for pred, index in zip(prediction, indices):
+                            # save patch index: (C,D,H,W)
+                            if prediction_channel is None:
+                                channel_slice = slice(0, out_channels)
+                            else:
+                                channel_slice = slice(0, 1)
+                            index = (channel_slice,) + index
 
-                        logger.info(f'Saving predictions for slice:{index}...')
+                            if prediction_channel is not None:
+                                # use only the 'prediction_channel'
+                                logger.info(f"Using channel '{prediction_channel}'...")
+                                pred = np.expand_dims(pred[prediction_channel], axis=0)
 
-                        # remove halo in order to avoid block artifacts in the output probability maps
-                        u_prediction, u_index = remove_halo(pred, index, volume_shape, patch_halo)
-                        # accumulate probabilities into the output prediction array
-                        prediction_map[u_index] += u_prediction
-                        # count voxel visits for normalization
-                        normalization_mask[u_index] += 1
+                            logger.info(f'Saving predictions for slice:{index}...')
+
+                            # remove halo in order to avoid block artifacts in the output probability maps
+                            u_prediction, u_index = remove_halo(pred, index, volume_shape, patch_halo)
+                            # accumulate probabilities into the output prediction array
+                            prediction_map[u_index] += u_prediction
+                            # count voxel visits for normalization
+                            normalization_mask[u_index] += 1
+
+            print("\n", "-"*20, "Summary", "-"*20)
+            latency = total_time / total_sample * 1000
+            throughput = total_sample / total_time
+            print("inference Latency: {} ms".format(latency))
+            print("inference Throughput: {} samples/s".format(throughput))
+
+        def trace_handler(p):
+            output = p.key_averages().table(sort_by="self_cpu_time_total")
+            print(output)
+            import pathlib
+            timeline_dir = str(pathlib.Path.cwd()) + '/timeline/'
+            if not os.path.exists(timeline_dir):
+                try:
+                    os.makedirs(timeline_dir)
+                except:
+                    pass
+            timeline_file = timeline_dir + 'timeline-' + str(torch.backends.quantized.engine) + '-' + \
+                        '3dunet-' + str(p.step_num) + '-' + str(os.getpid()) + '.json'
+            p.export_chrome_trace(timeline_file)
+
+        if self.config['oob']['profile']:
+            with torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                record_shapes=True,
+                schedule=torch.profiler.schedule(
+                    wait=int(self.config['oob']['num_iter']/2),
+                    warmup=2,
+                    active=1,
+                ),
+                on_trace_ready=trace_handler,
+            ) as p:
+                test(p=p)
+        else:
+            test()
+        return
 
         # save results
         logger.info(f'Saving predictions to: {output_file}')
